@@ -69,7 +69,7 @@ class Diagnosis(BaseModel):
     UnqualificationReason: str
 
 class ProcessDataRequest(BaseModel):
-    payment_year: int
+    dos_year: int
     memberships: List[Membership]
     diagnoses: List[Diagnosis]
 
@@ -151,18 +151,18 @@ def create_temp_tables(cursor):
     """)
 
 @lru_cache(maxsize=CACHE_SIZE)
-def process_data_with_sp_cached(payment_year: int, memberships_tuple: tuple, diagnoses_tuple: tuple):
+def process_data_with_sp_cached(dos_year: int, memberships_tuple: tuple, diagnoses_tuple: tuple):
     """Cached version of the data processing function."""
     try:
         memberships = [dict(m) for m in memberships_tuple]
         diagnoses = [dict(d) for d in diagnoses_tuple]
         with get_db_cursor() as cursor:
-            return process_data_with_sp(cursor, payment_year, memberships, diagnoses)
+            return process_data_with_sp(cursor, dos_year, memberships, diagnoses)
     except Exception as e:
         logger.error(f"Cache processing error: {str(e)}")
         raise
 
-def process_data_with_sp(cursor, payment_year, memberships, diagnoses):
+def process_data_with_sp(cursor, dos_year, memberships, diagnoses):
     """Process data using the stored procedure."""
     try:
         create_temp_tables(cursor)
@@ -233,7 +233,7 @@ def process_data_with_sp(cursor, payment_year, memberships, diagnoses):
                        
  
             EXEC dbo.sp_RS_Medicare_PartC_Outer_Suspect @PmtYear, @Membership, @DxTable,2;
-        """, (payment_year,))
+        """, (dos_year,))
         
         results = cursor.fetchall()
         logger.info(f"Retrieved {len(results)} records from stored procedure")
@@ -259,7 +259,7 @@ async def process_data(request: ProcessDataRequest):
         
         try:
             results = process_data_with_sp_cached(
-                request.payment_year,
+                request.dos_year,
                 memberships_tuple,
                 diagnoses_tuple
             )
@@ -268,7 +268,7 @@ async def process_data(request: ProcessDataRequest):
             logger.error(f"Cache error: {str(e)}")
             process_data_with_sp_cached.cache_clear()
             results = process_data_with_sp_cached(
-                request.payment_year,
+                request.dos_year,
                 memberships_tuple,
                 diagnoses_tuple
             )
