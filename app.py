@@ -164,66 +164,80 @@ def process_data_with_sp_cached(payment_year: int, memberships_tuple: tuple, dia
 def process_data_with_sp(cursor, payment_year, memberships, diagnoses):
     """Process data using the stored procedure."""
     try:
+        create_temp_tables(cursor)
+        logger.info('Temp tables created successfully')
+ 
+        df_members = pd.DataFrame(memberships)
+        df_members = df_members.rename(columns={'DOB': 'BirthDate'})
+        total_members = len(df_members)
+        batch_size = 1000
+ 
+        logger.info("Inserting membership data...")
+        for i in tqdm(range(0, total_members, batch_size), desc="Processing members"):
+            batch = df_members.iloc[i:i+batch_size]
+            for _, row in batch.iterrows():
+                cursor.execute("""
+                    INSERT INTO #TempMembership 
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    str(row.MemberID),
+                    str(row.BirthDate),
+                    str(row.Gender),
+                    str(row.RAType),
+                    str(row.Hospice),
+                    str(row.get('LTIMCAID', 'N')),
+                    str(row.get('NEMCAID', 'N')),
+                    str(row.OREC)
+                ))
+ 
+        df_diag = pd.DataFrame(diagnoses)
+        total_diag = len(df_diag)
+ 
+        logger.info("Inserting diagnosis data...")
+        for i in tqdm(range(0, total_diag, batch_size), desc="Processing diagnoses"):
+            batch = df_diag.iloc[i:i+batch_size]
+            for _, row in batch.iterrows():
+                cursor.execute("""
+                    INSERT INTO #TempDiagnosis 
+                    VALUES (%s, %s, %s, %s,%s,%s)
+                """, (
+                    str(row.MemberID),
+                    str(row.FromDOS),
+                    str(row.ThruDOS),
+                    str(row.DxCode),
+                    int(row.QualificationFlag),
+                    str(row.UnqualificationReason)
+                ))
+ 
         logger.info('Executing stored procedure...')
-        
-        # Build the SQL statement for diagnoses - notice the order of columns matches the working SQL
-        dx_values = []
-        first_dx = True
-        for diag in diagnoses:
-            if first_dx:
-                dx_values.append(f"""select      '{diag['MemberID']}','{diag['FromDOS']}','{diag['ThruDOS']}','{diag['DxCode']}',{diag['QualificationFlag']},NULL""")
-                first_dx = False
-            else:
-                dx_values.append(f"""select '{diag['MemberID']}','{diag['FromDOS']}','{diag['ThruDOS']}','{diag['DxCode']}',{diag['QualificationFlag']},NULL""")
-        dx_insert = "\nUNION ".join(dx_values)
-
-        # Build the SQL statement for memberships
-        mem_values = []
-        first_mem = True
-        for member in memberships:
-            if first_mem:
-                mem_values.append(f"""select '{member['MemberID']}',            '{member['DOB']}',   '{member['Gender']}',    '{member['RAType']}',       '{member['Hospice']}',    '{member['LTIMCAID']}',    '{member['NEMCAID']}',        {member['OREC']}""")
-                first_mem = False
-            else:
-                mem_values.append(f"""SELECT '{member['MemberID']}',            '{member['DOB']}',   '{member['Gender']}',    '{member['RAType']}',       '{member['Hospice']}',    '{member['LTIMCAID']}',    '{member['NEMCAID']}',        {member['OREC']}""")
-        mem_insert = "\nUNION\n".join(mem_values)
-
-        # Combine everything into a single SQL batch - exactly matching the working SQL
-        sql = f"""
-Declare @Membership as InputMembership_PartC
-Declare @DxTable as [InputDiagnosisSuspect_MVP1]
-insert into @DxTable
-{dx_insert}
-
-insert into @Membership
-{mem_insert}
-
-exec [dbo].[sp_RS_Medicare_PartC_Outer_Suspect] {payment_year}, @Membership, @DxTable, 2
-"""
-        
-        # For debugging - print the exact SQL being executed
-        logger.info(f"Executing SQL: {sql}")
-        
-        cursor.execute(sql)
-        
-        # Try to get results, but don't fail if there aren't any
-        try:
-            results = cursor.fetchall()
-        except:
-            results = []
+        cursor.execute("""
+            DECLARE @PmtYear INT = %s;
+            Declare @Membership as InputMembership_PartC
+            Declare @DxTable as [InputDiagnosisSuspect_MVP1]
             
-        # Return success response even if no results
-        response = {
-            'status': 'success',
-            'message': 'Stored procedure executed successfully',
-            'results': results,
-            'count': len(results),
-            'sql_executed': sql  # Include the SQL for debugging
-        }
-        
-        logger.info(f"Stored procedure executed successfully. Results count: {len(results)}")
-        return response
+            INSERT INTO @Membership (
+                MemberID, BirthDate, Gender, RAType, 
+                Hospice, LTIMCAID, NEMCAID, OREC
+            )
+            SELECT 
+                MemberID, BirthDate, Gender, RAType,
+                Hospice, LTIMCAID, NEMCAID, OREC
+            FROM #TempMembership;
+            
+            INSERT INTO @DxTable (MemberID, FromDOS, ThruDOS, DxCode,QualificationFlag,UnqualificationReason)
+            SELECT MemberID, FromDOS, ThruDOS, DxCode,QualificationFlag,UnqualificationReason
+            FROM #TempDiagnosis;
+   
 
+                       
+ 
+            EXEC dbo.sp_RS_Medicare_PartC_Outer_Suspect @PmtYear, @Membership, @DxTable,2;
+        """, (payment_year,))
+        
+        results = cursor.fetchall()
+        logger.info(f"Retrieved {len(results)} records from stored procedure")
+        return results
+ 
     except Exception as e:
         logger.error(f"Error in process_data_with_sp: {str(e)}")
         raise
@@ -243,7 +257,7 @@ async def process_data(request: ProcessDataRequest):
         diagnoses_tuple = tuple(tuple(sorted(d.items())) for d in diagnoses_dict)
         
         try:
-            response = process_data_with_sp_cached(
+            results = process_data_with_sp_cached(
                 request.payment_year,
                 memberships_tuple,
                 diagnoses_tuple
@@ -252,17 +266,23 @@ async def process_data(request: ProcessDataRequest):
         except Exception as e:
             logger.error(f"Cache error: {str(e)}")
             process_data_with_sp_cached.cache_clear()
-            response = process_data_with_sp_cached(
+            results = process_data_with_sp_cached(
                 request.payment_year,
                 memberships_tuple,
                 diagnoses_tuple
             )
             cache_status = "Cache miss"
             
-        response['cache_status'] = cache_status
-        response['timestamp'] = datetime.now().isoformat()
-        
-        return response
+        response_data = {
+            'status': 'success',
+            'message': 'Data processed successfully',
+            'cache_status': cache_status,
+            'count': len(results),
+            'results': results,
+            'timestamp': datetime.now().isoformat()
+        }
+        logger.info(f"Successfully processed {len(results)} records ({cache_status})")
+        return response_data
  
     except Exception as e:
         error_message = str(e)
@@ -280,6 +300,7 @@ async def process_data(request: ProcessDataRequest):
 @app.get("/health")
 async def health_check():
     return {"status": "healthy"}
+
 
 if __name__ == '__main__':
     import uvicorn
