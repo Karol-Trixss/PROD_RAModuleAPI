@@ -1,0 +1,287 @@
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Optional
+import json
+import pymssql  # Changed from pyodbc to pymssql
+import logging
+import time
+from contextlib import contextmanager
+from tqdm import tqdm
+import pandas as pd
+import decimal
+from datetime import datetime, date
+import os
+from fastapi.responses import HTMLResponse
+from functools import lru_cache
+from dotenv import load_dotenv
+import sys
+
+# Load environment variables
+load_dotenv()
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
+# Cache configuration
+CACHE_SIZE = 128
+CACHE_TTL = 3600  # 1 hour in seconds
+
+app = FastAPI(title="RAF Calculator API")
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Pydantic models
+class Membership(BaseModel):
+    MemberID: str
+    DOB: str
+    Gender: str
+    RAType: str
+    Hospice: str
+    LTIMCAID: str
+    NEMCAID: str
+    OREC: str
+
+    class Config:
+        extra = "forbid"
+
+class Diagnosis(BaseModel):
+    MemberID: str
+    FromDOS: str
+    ThruDOS: str
+    DxCode: str
+    QualificationFlag: int
+    UnqualificationReason: str
+
+class ProcessDataRequest(BaseModel):
+    payment_year: int
+    memberships: List[Membership]
+    diagnoses: List[Diagnosis]
+
+def get_db_connection():
+    """Establish a connection to the database."""
+    try:
+        conn = pymssql.connect(
+            server='10.10.1.4',
+            database='RAModuleDev',
+            user='karol_bhandari',
+            password='P@ssword7178!',
+            port='1433',
+            charset='UTF-8',
+            timeout=30
+        )
+        logger.info("Database connection successful")
+        return conn
+    except pymssql.Error as e:
+        logger.error(f"Database connection error: {str(e)}")
+        raise
+
+@contextmanager
+def get_db_cursor():
+    """Context manager for database connections."""
+    conn = None
+    cursor = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(as_dict=True)
+        yield cursor
+        conn.commit()
+    except Exception as e:
+        if conn:
+            try:
+                conn.rollback()
+            except:
+                pass
+        raise
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except:
+                pass
+        if conn:
+            try:
+                conn.close()
+            except:
+                pass
+
+def create_temp_tables(cursor):
+    """Create temporary tables for both membership and diagnosis data."""
+    cursor.execute("""
+    IF OBJECT_ID('tempdb..#TempMembership') IS NOT NULL
+        DROP TABLE #TempMembership;
+    IF OBJECT_ID('tempdb..#TempDiagnosis') IS NOT NULL
+        DROP TABLE #TempDiagnosis;
+ 
+    CREATE TABLE #TempMembership (
+        MemberID VARCHAR(50) NOT NULL,
+        BirthDate DATE NOT NULL,
+        Gender VARCHAR(1) NULL,
+        RAType VARCHAR(10) NULL,
+        Hospice VARCHAR(1) NULL,
+        LTIMCAID VARCHAR(1) NULL,
+        NEMCAID VARCHAR(1) NULL,
+        OREC VARCHAR(1) NULL
+    );
+ 
+    CREATE TABLE #TempDiagnosis (
+        MemberID VARCHAR(50) NOT NULL,
+        FromDOS DATE NOT NULL,
+        ThruDOS DATE NOT NULL,
+        DxCode VARCHAR(20) NOT NULL,
+        QualificationFlag INT(20) NOT NULL,
+	    UnqualificationReason VARCHAR(20)
+                   
+    );
+    """)
+
+@lru_cache(maxsize=CACHE_SIZE)
+def process_data_with_sp_cached(payment_year: int, memberships_tuple: tuple, diagnoses_tuple: tuple):
+    """Cached version of the data processing function."""
+    try:
+        memberships = [dict(m) for m in memberships_tuple]
+        diagnoses = [dict(d) for d in diagnoses_tuple]
+        with get_db_cursor() as cursor:
+            return process_data_with_sp(cursor, payment_year, memberships, diagnoses)
+    except Exception as e:
+        logger.error(f"Cache processing error: {str(e)}")
+        raise
+def process_data_with_sp(cursor, payment_year, memberships, diagnoses):
+    """Process data using the stored procedure."""
+    try:
+        logger.info('Executing stored procedure...')
+        
+        # Build the SQL statement for diagnoses - notice the order of columns matches the working SQL
+        dx_values = []
+        first_dx = True
+        for diag in diagnoses:
+            if first_dx:
+                dx_values.append(f"""select      '{diag['MemberID']}','{diag['FromDOS']}','{diag['ThruDOS']}','{diag['DxCode']}',{diag['QualificationFlag']},NULL""")
+                first_dx = False
+            else:
+                dx_values.append(f"""select '{diag['MemberID']}','{diag['FromDOS']}','{diag['ThruDOS']}','{diag['DxCode']}',{diag['QualificationFlag']},NULL""")
+        dx_insert = "\nUNION ".join(dx_values)
+
+        # Build the SQL statement for memberships
+        mem_values = []
+        first_mem = True
+        for member in memberships:
+            if first_mem:
+                mem_values.append(f"""select '{member['MemberID']}',            '{member['DOB']}',   '{member['Gender']}',    '{member['RAType']}',       '{member['Hospice']}',    '{member['LTIMCAID']}',    '{member['NEMCAID']}',        {member['OREC']}""")
+                first_mem = False
+            else:
+                mem_values.append(f"""SELECT '{member['MemberID']}',            '{member['DOB']}',   '{member['Gender']}',    '{member['RAType']}',       '{member['Hospice']}',    '{member['LTIMCAID']}',    '{member['NEMCAID']}',        {member['OREC']}""")
+        mem_insert = "\nUNION\n".join(mem_values)
+
+        # Combine everything into a single SQL batch - exactly matching the working SQL
+        sql = f"""
+Declare @Membership as InputMembership_PartC
+Declare @DxTable as [InputDiagnosisSuspect_MVP1]
+insert into @DxTable
+{dx_insert}
+
+insert into @Membership
+{mem_insert}
+
+exec [dbo].[sp_RS_Medicare_PartC_Outer_Suspect] {payment_year}, @Membership, @DxTable, 2
+"""
+        
+        # For debugging - print the exact SQL being executed
+        logger.info(f"Executing SQL: {sql}")
+        
+        cursor.execute(sql)
+        
+        # Try to get results, but don't fail if there aren't any
+        try:
+            results = cursor.fetchall()
+        except:
+            results = []
+            
+        # Return success response even if no results
+        response = {
+            'status': 'success',
+            'message': 'Stored procedure executed successfully',
+            'results': results,
+            'count': len(results),
+            'sql_executed': sql  # Include the SQL for debugging
+        }
+        
+        logger.info(f"Stored procedure executed successfully. Results count: {len(results)}")
+        return response
+
+    except Exception as e:
+        logger.error(f"Error in process_data_with_sp: {str(e)}")
+        raise
+
+@app.get("/")
+async def root():
+    return {"message": "Welcome to RAF Calculator API"}
+
+@app.post("/process_data")
+async def process_data(request: ProcessDataRequest):
+    """API endpoint to handle data processing with caching."""
+    try:
+        logger.info(f"Processing data for {len(request.memberships)} members and {len(request.diagnoses)} diagnoses")
+        memberships_dict = [membership.model_dump() for membership in request.memberships]
+        diagnoses_dict = [diagnosis.model_dump() for diagnosis in request.diagnoses]
+        memberships_tuple = tuple(tuple(sorted(m.items())) for m in memberships_dict)
+        diagnoses_tuple = tuple(tuple(sorted(d.items())) for d in diagnoses_dict)
+        
+        try:
+            response = process_data_with_sp_cached(
+                request.payment_year,
+                memberships_tuple,
+                diagnoses_tuple
+            )
+            cache_status = "Cache hit"
+        except Exception as e:
+            logger.error(f"Cache error: {str(e)}")
+            process_data_with_sp_cached.cache_clear()
+            response = process_data_with_sp_cached(
+                request.payment_year,
+                memberships_tuple,
+                diagnoses_tuple
+            )
+            cache_status = "Cache miss"
+            
+        response['cache_status'] = cache_status
+        response['timestamp'] = datetime.now().isoformat()
+        
+        return response
+ 
+    except Exception as e:
+        error_message = str(e)
+        logger.error(f"Error: {error_message}")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                'status': 'error',
+                'message': 'Internal server error',
+                'error': error_message,
+                'timestamp': datetime.now().isoformat()
+            }
+        )
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy"}
+
+if __name__ == '__main__':
+    import uvicorn
+    port = int(os.getenv("PORT", 8002))
+    uvicorn.run(app, host='0.0.0.0', port=port)
