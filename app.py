@@ -144,7 +144,7 @@ def create_temp_tables(cursor):
         FromDOS DATE NOT NULL,
         ThruDOS DATE NOT NULL,
         DxCode VARCHAR(20) NOT NULL,
-        QualificationFlag INT NOT NULL,
+        QualificationFlag int NOT NULL,
 	    UnqualificationReason VARCHAR(20)
                    
     );
@@ -161,6 +161,7 @@ def process_data_with_sp_cached(payment_year: int, memberships_tuple: tuple, dia
     except Exception as e:
         logger.error(f"Cache processing error: {str(e)}")
         raise
+
 def process_data_with_sp(cursor, payment_year, memberships, diagnoses):
     """Process data using the stored procedure."""
     try:
@@ -300,7 +301,6 @@ async def process_data(request: ProcessDataRequest):
 @app.get("/health")
 async def health_check():
     return {"status": "healthy"}
-
 
 if __name__ == '__main__':
     import uvicorn
