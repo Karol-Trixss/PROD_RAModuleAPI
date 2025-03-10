@@ -144,7 +144,7 @@ def create_temp_tables(cursor):
         FromDOS DATE NOT NULL,
         ThruDOS DATE NOT NULL,
         DxCode VARCHAR(20) NOT NULL,
-        QualificationFlag INT(20) NOT NULL,
+        QualificationFlag INT NOT NULL,
 	    UnqualificationReason VARCHAR(20)
                    
     );
