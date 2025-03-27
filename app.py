@@ -214,7 +214,7 @@ def process_data_with_sp(cursor, dos_year, memberships, diagnoses):
         cursor.execute("""
             DECLARE @PmtYear INT = %s;
             Declare @Membership as InputMembership_PartC
-            Declare @DxTable as [InputDiagnosisSuspect_MVP1]
+            Declare @DxTable as [InputDiagnosisSuspect]
             
             INSERT INTO @Membership (
                 MemberID, BirthDate, Gender, RAType, 
