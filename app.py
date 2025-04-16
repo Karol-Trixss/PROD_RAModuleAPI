@@ -78,7 +78,7 @@ def get_db_connection():
     try:
         conn = pymssql.connect(
             server='10.10.1.4',
-            database='RAModuleQA',
+            database='RAModule_Demo1',
             user='etl_user',
             password='etl_user',
             port='1433',
