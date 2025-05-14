@@ -68,4 +68,4 @@ jobs:
         with:
           app-name: 'PROD-RAModule-Suspect'
           slot-name: 'Production'
-          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_2FFA12E8EAD54CA5A077D01CC5D229B4 }}
+          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_807FF7C4755A4427A6FC9113E3AFA889 }}
